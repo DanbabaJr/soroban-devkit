@@ -11,6 +11,7 @@ pub mod events;
 pub mod fee;
 pub mod inspect;
 pub mod invoke;
+pub mod network_capture;
 pub mod simulate;
 pub mod storage;
 pub mod submission;
@@ -47,10 +48,10 @@ pub use simulate::{
     SimulateResponse, SimulateTransactionRequest,
 };
 pub use storage::{
-    calculate_extension_cost, collect_extend_keys, contract_exists, extend_footprint, get_ttl_info,
-    get_ttl_info_for_keys, read_contract_state, read_ledger_entry, restore_footprint,
-    restore_params_from_simulation, ExtendResult, RestoreResult, StateReadResult, TtlEntry,
-    TtlInfo,
+    calculate_extension_cost, collect_extend_keys, contract_exists, extend_footprint,
+    fetch_ledger_entries, get_ttl_info, get_ttl_info_for_keys, read_contract_state,
+    read_ledger_entry, restore_footprint, restore_params_from_simulation, ExtendResult,
+    RestoreResult, StateReadResult, TtlEntry, TtlInfo,
 };
 pub use submission::{
     extract_contract_events, get_transaction_status, poll_transaction, send_transaction,
