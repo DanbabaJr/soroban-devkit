@@ -7,7 +7,7 @@ use sdkt_rpc::inspect::StorageSummary;
 use sdkt_rpc::wasm::get_wasm_bytecode;
 use sdkt_rpc::{
     estimate_dynamic_fee, extend_footprint, first_topic_filter, get_contract_events_filtered,
-    get_next_sequence, get_ttl_info, get_wasm_metadata, inspect_account, inspect_contract,
+    get_next_sequence, get_ttl_info_for_keys, get_wasm_metadata, inspect_account, inspect_contract,
     inspect_transaction, read_contract_state, restore_footprint, simulate_transaction,
     SorobanRpcClient, StorageKeyInfo, TtlInfoSummary,
 };
@@ -17,7 +17,7 @@ use sdkt_storage::{
 };
 use sdkt_wasm::spec::parse_contract_spec;
 use sdkt_xdr::abi_decode::decode_event_topics;
-use sdkt_xdr::decode;
+use sdkt_xdr::decode_with_config;
 use sdkt_xdr::{
     build_invoke_transaction, sign_transaction, Ed25519Signer, InvokeTransactionParams, Network,
     SigningError, SigningOptions,
@@ -207,6 +207,8 @@ enum Commands {
     },
     /// Inspect a contract's ABI and storage
     Inspect {
+        /// Stellar contract ID (C... StrKey format)
+        #[arg(value_name = "CONTRACT_ID")]
         contract_id: String,
         #[arg(short, long, default_value = "pretty")]
         format: String,
@@ -283,6 +285,8 @@ enum Commands {
     },
     /// Event explorer
     Events {
+        /// Stellar contract ID (C... StrKey format)
+        #[arg(value_name = "CONTRACT_ID")]
         contract_id: String,
         #[arg(short, long, default_value = "pretty")]
         format: String,
@@ -308,6 +312,8 @@ enum Commands {
     },
     /// Inspect an account's balances and signers
     Account {
+        /// Stellar account address (G... StrKey format)
+        #[arg(value_name = "ADDRESS")]
         address: String,
         #[arg(short, long, default_value = "pretty")]
         format: String,
@@ -728,6 +734,12 @@ enum IdentityAction {
         name: String,
         /// Secret key, or `-` to read it from stdin (keeps the secret out of
         /// the process argv / `ps` output — the path CI smoke jobs need).
+        ///
+        /// DEPRECATED (issue #64): passing the secret as a positional argv
+        /// value exposes it to shell history, `ps` output, and CI logs.
+        /// Prefer `sdkt identity import <name> -` and pipe the secret on
+        /// stdin. The argv path still works but prints a deprecation
+        /// warning on stderr.
         secret: String,
     },
     /// List all saved identities
@@ -738,15 +750,21 @@ enum IdentityAction {
     },
     /// Show a single identity by name
     Show {
+        /// Identity name
+        #[arg(value_name = "NAME")]
         name: String,
         /// Output format (pretty or json)
         #[arg(short, long, default_value = "pretty")]
         format: String,
     },
     Delete {
+        /// Identity name
+        #[arg(value_name = "NAME")]
         name: String,
     },
     Default {
+        /// Identity name
+        #[arg(value_name = "NAME")]
         name: String,
     },
     /// Fund an identity via the Stellar Testnet Friendbot.
@@ -782,6 +800,8 @@ enum PluginAction {
     },
     /// Show metadata for an installed plugin
     Show {
+        /// Plugin ID
+        #[arg(value_name = "ID")]
         id: String,
         /// Output format (pretty or json)
         #[arg(short, long, default_value = "pretty")]
@@ -808,6 +828,8 @@ enum PluginAction {
     },
     /// Remove an installed plugin by id (idempotent)
     Remove {
+        /// Plugin ID
+        #[arg(value_name = "ID")]
         id: String,
         /// Output format (pretty or json)
         #[arg(short, long, default_value = "pretty")]
@@ -910,6 +932,8 @@ enum CacheAction {
     },
     /// Remove a specific hash from the cache
     Remove {
+        /// 64-character hex SHA256 hash of the WASM artifact
+        #[arg(value_name = "HASH")]
         hash: String,
         #[arg(short, long, default_value = "testnet")]
         network: String,
@@ -1166,7 +1190,15 @@ enum PackageCommand {
 #[derive(Subcommand)]
 enum StorageAction {
     Check {
+        /// Stellar contract ID (C... StrKey format)
+        #[arg(value_name = "CONTRACT_ID")]
         contract_id: String,
+        /// Repeatable: extra ledger keys (base64 XDR or hex XDR) to include in
+        /// the check. The contract instance key is always included.
+        /// Without these the check touches only the instance entry, so the
+        /// `[storage] max_entries` batch size has nothing to chunk.
+        #[arg(long, value_name = "BASE64_XDR", alias = "key")]
+        key_xdr: Vec<String>,
         #[arg(short, long, default_value = "pretty")]
         format: String,
     },
@@ -1181,7 +1213,8 @@ enum StorageAction {
     /// cannot be predicted offline. For live on-chain storage inspection, use
     /// `sdkt storage analyze`.
     Estimate {
-        /// Path to the compiled contract WASM file.
+        /// Path to the compiled contract WASM file
+        #[arg(value_name = "WASM")]
         wasm: String,
         /// Number of ledgers to estimate extension cost for (default: 17280, ~1 day at 5s/ledger).
         #[arg(short, long, default_value = "17280")]
@@ -1194,6 +1227,8 @@ enum StorageAction {
     /// categorization, TTL summary, and per-entry detail).
     #[command(alias = "snapshot")]
     Analyze {
+        /// Stellar contract ID (C... StrKey format)
+        #[arg(value_name = "CONTRACT_ID")]
         contract_id: String,
         /// Repeatable: extra ledger keys (base64 XDR or hex XDR) to include in
         /// the analysis. The contract instance key is always included.
@@ -1403,6 +1438,7 @@ fn derive_verdict(
     verified: Option<bool>,
     expiring_soon: usize,
     total_entries: usize,
+    expiring_soon_ledgers: u32,
 ) -> (String, Vec<String>) {
     let mut reasons: Vec<String> = Vec::new();
 
@@ -1416,6 +1452,7 @@ or confirm you are comparing the correct artifact."
     }
 
     if expiring_soon > 0 {
+        let warning_days = (u64::from(expiring_soon_ledgers) * 5).div_ceil(86_400);
         reasons.push(format!(
             "{} storage entr{} expiring soon (within ~{} day{}).",
             expiring_soon,
@@ -1424,12 +1461,8 @@ or confirm you are comparing the correct artifact."
             } else {
                 "ies are"
             },
-            (u64::from(EXPIRING_SOON_LEDGERS) * 5).div_ceil(86_400),
-            if (u64::from(EXPIRING_SOON_LEDGERS) * 5).div_ceil(86_400) == 1 {
-                ""
-            } else {
-                "s"
-            }
+            warning_days,
+            if warning_days == 1 { "" } else { "s" }
         ));
     }
 
@@ -1477,10 +1510,15 @@ async fn contract_health(
     let on_chain_hash = inspection.wasm_hash;
 
     // Storage posture (read-only, existing RPC via StorageAnalyzer).
-    let storage_report = sdkt_storage::StorageAnalyzer::new(client.clone())
-        .inspect_contract_storage(contract_id)
-        .await
-        .map_err(|e| format!("{}", e))?;
+    let cfg = load_config();
+    let storage_report = sdkt_storage::StorageAnalyzer::with_config(
+        client.clone(),
+        cfg.storage.max_entries,
+        cfg.storage.ttl_warning_days,
+    )
+    .inspect_contract_storage(contract_id)
+    .await
+    .map_err(|e| format!("{}", e))?;
 
     // Optional -style verification (reuse existing helper, no duplicate logic).
     let verified = local_hash
@@ -1493,7 +1531,13 @@ async fn contract_health(
         .map(|t| t.expiring_entries_count)
         .unwrap_or(0);
 
-    let (health, reasons) = derive_verdict(verified, expiring_soon, storage_report.total_entries);
+    let (health, reasons) = derive_verdict(
+        verified,
+        expiring_soon,
+        storage_report.total_entries,
+        // Saturating: same days→ledgers conversion as StorageAnalyzer.
+        cfg.storage.ttl_warning_days.saturating_mul(17_280),
+    );
 
     let ttl = storage_report.ttl_summary.as_ref().map(|t| HealthTtl {
         minimum_ttl: t.minimum_ttl,
@@ -2537,6 +2581,21 @@ fn parse_format_str(s: &str) -> OutputFormat {
             process::exit(1);
         }
     }
+}
+
+/// Terminate with a machine-parseable error envelope when `--format json` is
+/// active, otherwise keep the human-readable stderr contract.
+///
+/// JSON consumers pipe `sdkt <cmd> --format json` into `jq`; a prose line on
+/// stderr with empty stdout is a parse failure for them. In JSON mode the
+/// error goes to stdout as `{"error": "<msg>"}` and stderr stays empty.
+fn fail_cli(msg: impl AsRef<str>, json_mode: bool) -> ! {
+    if json_mode {
+        println!("{}", serde_json::json!({ "error": msg.as_ref() }));
+    } else {
+        eprintln!("{}", msg.as_ref());
+    }
+    process::exit(1);
 }
 
 /// Pretty-print a decoded transaction envelope for `tx decode`.
@@ -3816,11 +3875,36 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
                 // Reuse the shared project graph resolver as the validity oracle.
                 match sdkt_core::project::validate_project(&config) {
                     Ok(()) => {
+                        let mut sections = Vec::new();
+                        if config.decode.max_depth != DevKitConfig::default().decode.max_depth
+                            || config.decode.allow_fallback_hex
+                                != DevKitConfig::default().decode.allow_fallback_hex
+                        {
+                            sections.push(format!(
+                                "decode: max_depth={}, allow_fallback_hex={}",
+                                config.decode.max_depth, config.decode.allow_fallback_hex
+                            ));
+                        }
+                        if config.storage.max_entries != DevKitConfig::default().storage.max_entries
+                            || config.storage.ttl_warning_days
+                                != DevKitConfig::default().storage.ttl_warning_days
+                        {
+                            sections.push(format!(
+                                "storage: max_entries={}, ttl_warning_days={}",
+                                config.storage.max_entries, config.storage.ttl_warning_days
+                            ));
+                        }
+                        let detail = if sections.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; custom {}", sections.join("; "))
+                        };
                         checks.push(DoctorCheck::ok(
                             "project-config",
                             format!(
-                                ".sdkt.toml is valid ({} contract(s) configured)",
-                                config.contracts.len()
+                                ".sdkt.toml is valid ({} contract(s) configured){}",
+                                config.contracts.len(),
+                                detail
                             ),
                         ));
                     }
@@ -3898,16 +3982,36 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             format,
             file,
         } => {
+            let json_mode = parse_format_str(&format) == OutputFormat::Json;
             let input = match (file, payload) {
-                (Some(path), _) => fs::read_to_string(&path)?,
+                (Some(path), _) => fs::read_to_string(&path).unwrap_or_else(|e| {
+                    fail_cli(
+                        format!("Failed to read input file '{}': {}", path, e),
+                        json_mode,
+                    )
+                }),
                 (None, Some(p)) => p,
-                (None, None) => {
-                    return Err("no input provided: pass XDR as an argument or use --file".into());
-                }
+                (None, None) => fail_cli(
+                    "no input provided: pass XDR as an argument or use --file",
+                    json_mode,
+                ),
             };
 
             let fmt = parse_format_str(&format);
-            let json = decode(&input, r#type.as_deref(), fmt)?;
+            let cfg = load_config();
+            if let Err(e) = cfg.validate() {
+                fail_cli(e, json_mode);
+            }
+            let json = match decode_with_config(
+                &input,
+                r#type.as_deref(),
+                fmt,
+                cfg.decode.max_depth,
+                cfg.decode.allow_fallback_hex,
+            ) {
+                Ok(j) => j,
+                Err(e) => fail_cli(e.to_string(), json_mode),
+            };
             println!("{}", json);
         }
         Commands::Encode { values } => match run_encode(&values) {
@@ -4182,6 +4286,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             match action {
                 StorageAction::Check {
                     contract_id,
+                    key_xdr,
                     format,
                 } => {
                     let fmt = parse_format_str(&format);
@@ -4191,8 +4296,29 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         net.network_profile.clone(),
                     );
 
-                    // Load ABI spec if provided for storage decoding
-                    match get_ttl_info(&client, &contract_id).await {
+                    // Load ABI spec if provided for storage decoding.
+                    // Issue #375: honour [storage] config instead of the
+                    // hardcoded defaults inside get_ttl_info().
+                    let cfg = load_config();
+                    // Repeatable --key-xdr: validate as XDR LedgerKeys so the
+                    // configured max_entries batch size has something to chunk.
+                    // (Without them the check fetches only the instance entry.)
+                    let mut extra_keys: Vec<String> = Vec::new();
+                    for raw in &key_xdr {
+                        if let Err(e) = sdkt_xdr::decode_ledger_key(raw) {
+                            fail_cli(format!("invalid LedgerKey: {e}"), fmt == OutputFormat::Json);
+                        }
+                        extra_keys.push(raw.clone());
+                    }
+                    match get_ttl_info_for_keys(
+                        &client,
+                        &contract_id,
+                        &extra_keys,
+                        cfg.storage.max_entries,
+                        cfg.storage.ttl_warning_days.saturating_mul(17_280),
+                    )
+                    .await
+                    {
                         Ok(ttl_info) => {
                             if fmt == OutputFormat::Json {
                                 let mut output = serde_json::to_value(&ttl_info)?;
@@ -4256,7 +4382,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         net.network_passphrase.clone(),
                         net.network_profile.clone(),
                     );
-                    let analyzer = sdkt_storage::StorageAnalyzer::new(client);
+                    let cfg = load_config();
+                    let analyzer = sdkt_storage::StorageAnalyzer::with_config(
+                        client,
+                        cfg.storage.max_entries,
+                        cfg.storage.ttl_warning_days,
+                    );
 
                     match analyzer
                         .inspect_contract_storage_keys(&contract_id, &extra_keys)
@@ -4334,7 +4465,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         process::exit(1);
                     }
                     if let Err(e) = sdkt_rpc::collect_extend_keys(&contract, &key) {
-                        eprintln!("Error: {}", e);
+                        let err_str = e.to_string();
+                        let msg = match &e {
+                            sdkt_rpc::RpcError::Rpc(inner) => inner.as_str(),
+                            _ => err_str.strip_prefix("RPC error: ").unwrap_or(&err_str),
+                        };
+                        eprintln!("Error: {msg}");
                         process::exit(1);
                     }
 
@@ -5947,28 +6083,34 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             max_size_bytes,
         } => {
             let fmt = parse_format_str(&format);
+            let json_mode = fmt == OutputFormat::Json;
             // Size policy is evaluated only in diff output mode: mixing it
             // into --upgrade-safety would conflate size budget with ABI
             // compatibility, so the combination is rejected explicitly.
             if upgrade_safety && (max_size_bytes.is_some() || max_growth_pct.is_some()) {
-                eprintln!(
-                    "Error: size-policy flags apply to `sdkt diff` output only; \
-                     run without --upgrade-safety to enforce them (ABI verdict is a separate check)"
+                fail_cli(
+                    "size policy cannot be combined with --upgrade-safety",
+                    json_mode,
                 );
-                return Err("size policy cannot be combined with --upgrade-safety".into());
             }
             if let Err(e) = validate_size_threshold_bytes(max_size_bytes, "--max-size-bytes") {
-                eprintln!("Error: {e}");
-                return Err(e.into());
+                fail_cli(e, json_mode);
             }
             if let Err(e) = validate_size_threshold_pct(max_growth_pct, "--max-growth-pct") {
-                eprintln!("Error: {e}");
-                return Err(e.into());
+                fail_cli(e, json_mode);
             }
-            let old_bytes = fs::read(&old_wasm)
-                .map_err(|e| format!("Failed to read OLD WASM '{}': {}", old_wasm, e))?;
-            let new_bytes = fs::read(&new_wasm)
-                .map_err(|e| format!("Failed to read NEW WASM '{}': {}", new_wasm, e))?;
+            let old_bytes = fs::read(&old_wasm).unwrap_or_else(|e| {
+                fail_cli(
+                    format!("Failed to read OLD WASM '{}': {}", old_wasm, e),
+                    json_mode,
+                )
+            });
+            let new_bytes = fs::read(&new_wasm).unwrap_or_else(|e| {
+                fail_cli(
+                    format!("Failed to read NEW WASM '{}': {}", new_wasm, e),
+                    json_mode,
+                )
+            });
 
             match sdkt_wasm::diff_wasm(&old_bytes, &new_bytes) {
                 Ok(report) => {
@@ -6072,15 +6214,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     let violations =
                         evaluate_size_policy_for_diff(&report, max_size_bytes, max_growth_pct);
                     if !violations.is_empty() {
-                        for v in &violations {
-                            eprintln!("Error: size policy violation: {v}");
-                        }
-                        process::exit(1);
+                        fail_cli(
+                            format!("size policy violation: {}", violations.join("; ")),
+                            json_mode,
+                        );
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error diffing WASM: {}", e);
-                    process::exit(1);
+                    fail_cli(format!("Error diffing WASM: {}", e), json_mode);
                 }
             }
         }
@@ -6302,13 +6443,20 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
             for input in &paths {
                 let input_path = std::path::Path::new(input);
-                let discovered = collect_rust_sources(input_path).map_err(|e| {
+                let json_mode = audit_fmt == AuditFormat::Json;
+                let discovered = collect_rust_sources(input_path).unwrap_or_else(|e| {
                     if paths.len() == 1 && input_path.extension().is_some_and(|ext| ext == "rs") {
-                        format!("Failed to read source '{}': {}", input, e)
+                        fail_cli(
+                            format!("Failed to read source '{}': {}", input, e),
+                            json_mode,
+                        )
                     } else {
-                        format!("Failed to discover Rust sources '{}': {}", input, e)
+                        fail_cli(
+                            format!("Failed to discover Rust sources '{}': {}", input, e),
+                            json_mode,
+                        )
                     }
-                })?;
+                });
 
                 source_paths.extend(discovered);
             }
@@ -6317,7 +6465,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             source_paths.dedup();
 
             if source_paths.is_empty() {
-                return Err("No Rust source files (.rs) found in the supplied paths".into());
+                fail_cli(
+                    "No Rust source files (.rs) found in the supplied paths",
+                    audit_fmt == AuditFormat::Json,
+                );
             }
 
             let single_file = paths.len() == 1
@@ -6883,15 +7034,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Wasm { action, net } => match action {
             WasmAction::Inspect { file, format } => {
                 let fmt = parse_format_str(&format);
+                let json_mode = fmt == OutputFormat::Json;
 
                 let wasm_bytes = fs::read(&file).unwrap_or_else(|e| {
-                    eprintln!("Error reading WASM file {}: {}", file, e);
-                    process::exit(1);
+                    fail_cli(
+                        format!("Error reading WASM file {}: {}", file, e),
+                        json_mode,
+                    )
                 });
 
                 let metadata = sdkt_wasm::parse_metadata(&wasm_bytes).unwrap_or_else(|e| {
-                    eprintln!("Error parsing WASM metadata: {}", e);
-                    process::exit(1);
+                    fail_cli(format!("Error parsing WASM metadata: {}", e), json_mode)
                 });
 
                 // Attempt to parse contract spec, but it's optional
@@ -7040,9 +7193,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 // remaining ContractInspection fields without adding a circular
                 // sdkt-rpc -> sdkt-storage dependency.
                 let mut inspection = inspection;
-                if let Ok(report) = StorageAnalyzer::new(client.clone())
-                    .inspect_contract_storage(&contract)
-                    .await
+                let cfg = load_config();
+                if let Ok(report) = StorageAnalyzer::with_config(
+                    client.clone(),
+                    cfg.storage.max_entries,
+                    cfg.storage.ttl_warning_days,
+                )
+                .inspect_contract_storage(&contract)
+                .await
                 {
                     inspection.storage_summary = StorageSummary {
                         instance_entries: report.instance_entries,
@@ -7146,15 +7304,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         match cache.cache_info(&network) {
                             Ok(info) => {
                                 if fmt == OutputFormat::Json {
-                                    // In a real app we'd derive Serialize for CacheInfo,
-                                    // but we can manually output JSON here or derive it in sdkt-storage
-                                    println!(
-                                        "{{\"network\":\"{}\",\"entry_count\":{},\"total_metadata_size_bytes\":{},\"total_wasm_size_bytes\":{}}}",
-                                        info.network,
-                                        info.entry_count,
-                                        info.total_metadata_size_bytes,
-                                        info.total_wasm_size_bytes
-                                    );
+                                    // Serialize through serde_json rather than a
+                                    // hand-rolled format string so user-supplied
+                                    // network names (which may contain quotes,
+                                    // backslashes, or control characters) are
+                                    // escaped correctly. A small serializable
+                                    // struct keeps the field order stable.
+                                    #[derive(serde::Serialize)]
+                                    struct CacheInfoJson<'a> {
+                                        network: &'a str,
+                                        entry_count: usize,
+                                        total_metadata_size_bytes: u64,
+                                        total_wasm_size_bytes: u64,
+                                    }
+
+                                    let payload = CacheInfoJson {
+                                        network: &info.network,
+                                        entry_count: info.entry_count,
+                                        total_metadata_size_bytes: info.total_metadata_size_bytes,
+                                        total_wasm_size_bytes: info.total_wasm_size_bytes,
+                                    };
+                                    println!("{}", serde_json::to_string(&payload)?);
                                 } else {
                                     println!("Cache Info for Network '{}':", info.network);
                                     println!("Entries: {}", info.entry_count);
@@ -7208,8 +7378,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 IdentityAction::Import { name, secret } => {
-                    // `-` means: read the secret from stdin. A secret passed on
-                    // argv is visible to any process listing on the machine;
+                    // `-` means: read the secret from stdin. A secret passed
+                    // on argv is visible to any process listing on the machine;
                     // piping it in is the CI-safe path.
                     let secret = if secret == "-" {
                         use std::io::Read;
@@ -7219,6 +7389,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                             .map_err(|e| format!("Failed to read secret from stdin: {e}"))?;
                         buf.trim().to_string()
                     } else {
+                        // DEPRECATED (issue #64): argv secrets leak through
+                        // shell history, `ps`, and CI logs. Still functional
+                        // for backwards compatibility, but warn the user.
+                        eprintln!(
+                            "WARNING: passing the secret as a positional argv \
+                             argument exposes it to shell history, process listings, \
+                             and CI logs. Use `sdkt identity import <name> -` and \
+                             pipe the secret on stdin instead."
+                        );
                         secret
                     };
                     let identity = store.import(&name, &secret)?;
@@ -8766,13 +8945,38 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             };
 
-                            match sdkt_rpc::deploy_contract(
+                            // Parse and validate constructor arguments before upload (fail fast).
+                            // Convert TYPE:VALUE to base64 ScVal (same as single-deploy path).
+                            let parsed_args = match parse_typed_args(&contract.ctor_args, false) {
+                                Ok(args) => args,
+                                Err(e) => {
+                                    failure = Some(format!(
+                                        "Invalid constructor argument for '{}': {}",
+                                        contract.alias, e
+                                    ));
+                                    eprintln!("    ✗ {}", failure.as_ref().unwrap());
+                                    break;
+                                }
+                            };
+
+                            // Validate the converted ScVal args.
+                            if let Err(e) = sdkt_xdr::parse_scval_args(&parsed_args) {
+                                failure = Some(format!(
+                                    "Invalid constructor argument for '{}': {}",
+                                    contract.alias, e
+                                ));
+                                eprintln!("    ✗ {}", failure.as_ref().unwrap());
+                                break;
+                            }
+
+                            match sdkt_rpc::deploy_contract_with_args(
                                 &client,
                                 &wasm_bytes,
                                 &source_account,
                                 &signer,
                                 network.clone(),
                                 salt_bytes,
+                                parsed_args,
                             )
                             .await
                             {
@@ -9730,14 +9934,14 @@ mod m23_tests {
 
     #[test]
     fn derive_verdict_healthy() {
-        let (h, reasons) = derive_verdict(Some(true), 0, 12);
+        let (h, reasons) = derive_verdict(Some(true), 0, 12, 17_280);
         assert_eq!(h, "healthy");
         assert!(reasons.is_empty());
     }
 
     #[test]
     fn derive_verdict_at_risk_expiring() {
-        let (h, reasons) = derive_verdict(Some(true), 2, 12);
+        let (h, reasons) = derive_verdict(Some(true), 2, 12, 17_280);
         assert_eq!(h, "at_risk");
         let reason = reasons
             .iter()
@@ -9751,14 +9955,14 @@ mod m23_tests {
     #[test]
     fn derive_verdict_critical_mismatch() {
         // Mismatch wins over TTL, regardless of expiring count.
-        let (h, reasons) = derive_verdict(Some(false), 5, 12);
+        let (h, reasons) = derive_verdict(Some(false), 5, 12, 17_280);
         assert_eq!(h, "critical");
         assert!(reasons.iter().any(|r| r.contains("does NOT match")));
     }
 
     #[test]
     fn derive_verdict_at_risk_empty() {
-        let (h, reasons) = derive_verdict(None, 0, 0);
+        let (h, reasons) = derive_verdict(None, 0, 0, 17_280);
         assert_eq!(h, "at_risk");
         assert!(reasons.iter().any(|r| r.contains("no storage entries")));
     }
@@ -9766,7 +9970,7 @@ mod m23_tests {
     #[test]
     fn derive_verdict_onchain_only_healthy() {
         // No --wasm supplied (verified == None), nothing expiring → healthy.
-        let (h, reasons) = derive_verdict(None, 0, 7);
+        let (h, reasons) = derive_verdict(None, 0, 7, 17_280);
         assert_eq!(h, "healthy");
         assert!(reasons.is_empty());
     }

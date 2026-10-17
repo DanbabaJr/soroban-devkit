@@ -273,6 +273,10 @@ const INTENT_KEYWORDS: &[(&str, &[&[&str]])] = &[
     // there); the specificity pass below resolves it over the bare
     // `doctor` rule, which is a strict subset of these keywords.
     ("plugin.doctor", &[&["plugin", "doctor"]]),
+    (
+        "plugin.doctor",
+        &[&["plugin", "doctor"], &["plugin", "self-check"]],
+    ),
     ("doctor", &[&["doctor"], &["environment", "check"]]),
     ("wasm.metadata", &[&["metadata"]]),
     (
@@ -1002,6 +1006,10 @@ mod tests {
         );
         assert_eq!(parse("audit src/lib.rs").unwrap().capability_id, "audit");
         assert_eq!(parse("run doctor").unwrap().capability_id, "doctor");
+        assert_eq!(
+            parse("run plugin doctor").unwrap().capability_id,
+            "plugin.doctor"
+        );
         assert!(matches!(
             parse("check network status"),
             Err(ParseError::MissingArgument { capability_id, .. })
@@ -1369,5 +1377,49 @@ mod tests {
             }
             other => panic!("expected MissingArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wasm_metadata_extracts_contract() {
+        let i = parse("show wasm metadata for contract CAD6C24POQGRYXMBNBEGVDHUROF5ZC37XRDC6NCVILTXWMYJIBMISZCV").unwrap();
+        assert_eq!(i.capability_id, "wasm.metadata");
+        assert_eq!(
+            i.args.contract.as_deref(),
+            Some("CAD6C24POQGRYXMBNBEGVDHUROF5ZC37XRDC6NCVILTXWMYJIBMISZCV")
+        );
+    }
+
+    #[test]
+    fn storage_analyze_extracts_contract() {
+        let i = parse(
+            "storage analyze for contract CAD6C24POQGRYXMBNBEGVDHUROF5ZC37XRDC6NCVILTXWMYJIBMISZCV",
+        )
+        .unwrap();
+        assert_eq!(i.capability_id, "storage.analyze");
+        assert_eq!(
+            i.args.contract.as_deref(),
+            Some("CAD6C24POQGRYXMBNBEGVDHUROF5ZC37XRDC6NCVILTXWMYJIBMISZCV")
+        );
+    }
+
+    #[test]
+    fn events_extracts_contract() {
+        let i = parse(
+            "fetch events for contract CAD6C24POQGRYXMBNBEGVDHUROF5ZC37XRDC6NCVILTXWMYJIBMISZCV",
+        )
+        .unwrap();
+        assert_eq!(i.capability_id, "events");
+        assert_eq!(
+            i.args.contract.as_deref(),
+            Some("CAD6C24POQGRYXMBNBEGVDHUROF5ZC37XRDC6NCVILTXWMYJIBMISZCV")
+        );
+    }
+
+    #[test]
+    fn diff_base_route_extracts_roles_separately_from_upgrade_safety() {
+        let i = parse("diff baseline old.wasm candidate new.wasm").unwrap();
+        assert_eq!(i.capability_id, "diff");
+        assert_eq!(i.args.previous_wasm.as_deref(), Some("old.wasm"));
+        assert_eq!(i.args.wasm.as_deref(), Some("new.wasm"));
     }
 }
