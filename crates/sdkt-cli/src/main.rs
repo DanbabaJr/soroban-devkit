@@ -8766,13 +8766,38 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             };
 
-                            match sdkt_rpc::deploy_contract(
+                            // Parse and validate constructor arguments before upload (fail fast).
+                            // Convert TYPE:VALUE to base64 ScVal (same as single-deploy path).
+                            let parsed_args = match parse_typed_args(&contract.ctor_args, false) {
+                                Ok(args) => args,
+                                Err(e) => {
+                                    failure = Some(format!(
+                                        "Invalid constructor argument for '{}': {}",
+                                        contract.alias, e
+                                    ));
+                                    eprintln!("    ✗ {}", failure.as_ref().unwrap());
+                                    break;
+                                }
+                            };
+
+                            // Validate the converted ScVal args.
+                            if let Err(e) = sdkt_xdr::parse_scval_args(&parsed_args) {
+                                failure = Some(format!(
+                                    "Invalid constructor argument for '{}': {}",
+                                    contract.alias, e
+                                ));
+                                eprintln!("    ✗ {}", failure.as_ref().unwrap());
+                                break;
+                            }
+
+                            match sdkt_rpc::deploy_contract_with_args(
                                 &client,
                                 &wasm_bytes,
                                 &source_account,
                                 &signer,
                                 network.clone(),
                                 salt_bytes,
+                                parsed_args,
                             )
                             .await
                             {

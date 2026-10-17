@@ -353,6 +353,20 @@ or git logic is duplicated; the same `compute_dependency_integrity` /
 │   deploys it fresh, replacing the stale record. The default identity (see
 │   `sdkt identity`) is used to sign all deployments.
 │
+│   **Constructor arguments**: contracts requiring initialization parameters at
+│   create time declare them in `.sdkt.toml` via the `ctor_args` field:
+│
+│     [contracts.token]
+│     path = "contracts/token"
+│     ctor_args = ["address:G...", "u32:1000000"]
+│
+│   Each string is a TYPE:VALUE pair (same format as `sdkt deploy --arg`: `u32:100`,
+│   `address:G...`, `string:hello`, `bool:true`, `bytes:deadbeef`, etc.) or a
+│   base64-encoded ScVal. Invalid arguments fail before WASM upload (fail-fast
+│   validation) with the same error messages as the single-contract deploy path.
+│   Contracts without `ctor_args` deploy with empty constructor arguments (no
+│   change from pre-feature behavior).
+│
 ├── call
 │   ├── <CONTRACT_ID>
 │   ├── <FUNCTION>
