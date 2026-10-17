@@ -244,7 +244,15 @@ pub fn run_replay(options: &ReplayOptions) -> Result<ReplayOutcome, ReplayError>
     let wasm = std::fs::read(&options.wasm)
         .map_err(|e| ReplayError::Malformed(format!("reading {}: {e}", options.wasm.display())))?;
     let artifact = parse_artifact(&json)?;
-    replay(&artifact, &wasm)
+    replay(&artifact, &wasm).map_err(|e| match e {
+        // The library-level refusal names the artifact's recorded identity;
+        // the CLI also knows which file was read, so it says both.
+        ReplayError::MissingBudgetProfile { detail, .. } => ReplayError::MissingBudgetProfile {
+            artifact: format!("{} [{}]", options.artifact.display(), artifact.case_id),
+            detail,
+        },
+        other => other,
+    })
 }
 
 /// Render a replay outcome as a single canonical line (stable across
